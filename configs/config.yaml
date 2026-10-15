@@ -1,0 +1,128 @@
+# =============================================================================
+# Trustworthy anomaly detection for the Metro do Porto APU (MetroPT-3)
+# Every script reads this file. Values marked [data] were derived in the Phase 0
+# data check (notebooks/00_data_check.ipynb); [paper] values come from the cited source.
+# =============================================================================
+
+project:
+  seeds: [42, 43, 44]          # >= 3 seeds (problem statement, statistical honesty)
+  device: auto                 # auto | cuda | cpu
+
+paths:                         # relative paths are resolved from the project root
+  raw_csv: "/Users/abc/Desktop/paper/metropt+3+dataset/MetroPT3(AirCompressor).csv"
+  processed_dir: data/processed
+  results_dir: results
+
+# ---- ground truth: the only hard-coded data (Davari et al., SAC 2024, Table 1) ----
+failures:
+  - {name: F1, start: "2020-04-18 00:00", end: "2020-04-18 23:59", maintenance: "2020-04-19 01:00", severity: High}
+  - {name: F2, start: "2020-05-29 23:30", end: "2020-05-29 23:59", maintenance: "2020-05-30 12:00", severity: High,
+     end_alternative: "2020-05-30 06:00"}   # UCI end time; data check showed the compressor ran 97% until ~05:00
+  - {name: F3, start: "2020-06-05 10:00", end: "2020-06-07 14:30", maintenance: "2020-06-08 16:00", severity: High}
+  - {name: F4, start: "2020-07-15 14:30", end: "2020-07-15 19:00", maintenance: "2020-07-16 00:00", severity: Medium}
+f2_use_alternative_end: true   # [data] the data supports the longer F2 interval
+
+data:
+  gap_threshold_s: auto        # [data] Otsu break on log-intervals; Phase 0 found 194 s. A number here overrides it
+  running_signal: COMP         # [data] running <=> COMP == 0 (agreement 0.986 with the learned loaded states)
+  running_value: 0
+  frozen_bin: 10min            # bin in which R1 (all analog signals constant) is tested
+  resample: 10min              # [paper] Papadopoulos et al. 2026 input for TranAD / Isolation Forest
+  cycle_bins: 7                # [paper] Davari et al. 2024: "7 bins" per sensor per cycle
+
+evaluation:
+  predictive_horizon_h: 48     # [paper] benchmark PH; also the training buffer before each failure
+  warning_h: 2                 # operator requirement (problem statement; Veloso et al. 2022)
+  ad1_thresholds: 200          # score quantiles swept for the benchmark AD1 AUC-PR
+  episode_source: auto         # windows used for the candidate-aware metrics: auto = company if available, else derived
+  ad1_reference: [start, end]  # anchor the benchmark PH at failure start and at failure end (their choice is not documented)
+
+# Data-quality gate (DOCUMENTATION.md 2a). All switches off = baselines exactly as published.
+# They are part of the trustworthy layer and are switched on one at a time in the ablation.
+data_quality:
+  running_rule: comp           # 'comp' (as published) | 'comp_and_motor' (R2: COMP == 0 and motor loaded)
+  exclude_frozen_from_training: false     # R1
+  exclude_episodes_from_training: false   # R3: also drop [episode start - PH, episode end] from training
+  company_windows: configs/company_windows.csv   # operator's faulty windows (name,start,end); used if the file exists
+
+benchmark:                     # synthetic leaks and sensor faults (Phase 5, DOCUMENTATION.md 5a)
+  n_copies: 10                 # copies of the data, each with its own random events (enough validation events)
+  seed: 2024
+  spacing_h: 48                # minimum gap between events (= the predictive horizon)
+
+conformal:                     # Phase 5 step 2 (DOCUMENTATION.md 8b)
+  fa_targets: [0.05, 0.1, 0.25, 0.5, 1.0]   # operator's accepted false alarms per day -> eps = F / decisions per day
+  delta: 0.1                   # calibration-conditional guarantee holds with probability 1 - delta (Bates et al.)
+  lag_h: 48                    # a decision joins the rolling calibration only after this confirmation lag (= PH)
+  variants: [static, rolling, rolling_guard]
+
+combine:                       # Phase 5 step 3 (DOCUMENTATION.md 8c): static conformal p-values, Bonferroni on the rate scale
+  combinations:
+    all3: [lstm_ae, tranad, iforest]
+    tranad_lstm: [tranad, lstm_ae]
+  window_model: tranad         # whose run info gives the test window of a combination
+  report_targets: [0.1, 0.25, 0.5, 1.0]
+
+smoothing:                     # Phase 5 step 4 (DOCUMENTATION.md 8d): EWMA before the conformal step (Hundman et al.)
+  spans_h: [0, 0.5, 1, 2, 4, 8]  # candidate spans in hours (0 = no smoothing)
+  select_target: 0.5           # F at which the span is chosen on the validation leaks
+
+triage:                        # Phase 5 step 5 (DOCUMENTATION.md 8e): Geifman & El-Yaniv SGR on alarms
+  detector: tranad_lstm        # the operating detector (combination from step 06)
+  scheme: fixed                # the rolling split cannot reach the pair's budgets (reachability)
+  alarm_target: 1.0            # permissive alarm budget F (false alarms/day) feeding the triage
+  risk_targets: [0.05, 0.1, 0.2, 0.3]   # r*: tolerated share of false confirmed alarms
+  delta: 0.001                 # guarantee holds with probability 1 - delta (value used by Geifman & El-Yaniv)
+
+explain:                       # Phase 5 step 6 (DOCUMENTATION.md 8f): per-alarm explanations, fixed split
+  alarm_target: 1.0            # explain the alarms of each detector at this budget F (static conformal, ungated)
+
+audit:                         # Phase 5 step 7 (DOCUMENTATION.md 8g): consistency audit, fixed split
+  target: 0.5                  # budget F of the audited trustworthy subjects (static conformal, R1-gated)
+  combinations: [tranad_lstm]  # combined detectors audited alongside the single detectors
+  n_boot: 1000                 # block-bootstrap resamples over days
+  seed: 7
+
+splits:
+  schemes: [fixed, rolling]    # fixed: train before F1; rolling: retrain before each failure
+  val_fraction: 0.2            # last 20% of each training period (by time) -> model selection
+
+models: [lstm_ae, tranad, iforest]
+
+lstm_ae:                       # [paper] Davari et al., SAC 2024, Table 3
+  representation: cycles
+  seq_len: 10                  # cycles per input sequence (not given in the paper; ~3 h at the median cycle)
+  hidden: [256, 200, 140, 100, 60]
+  bottleneck: 20
+  dropout: 0.2
+  batch_size: 50
+  epochs: 100
+  lr: 0.001
+  patience: 10                 # early stopping on validation loss
+
+tranad:                        # [paper+code] Tuli et al., VLDB 2022, official implementation
+  representation: resampled
+  window: 10
+  dim_feedforward: 16
+  dropout: 0.1
+  batch_size: 128
+  epochs: 25                   # upper end of the benchmark grid {5..25}
+  lr: 0.001                    # in the benchmark grid {0.001, 0.005, 0.01, 0.05, 0.1}
+  weight_decay: 1.0e-5
+  scheduler_step: 5
+  scheduler_gamma: 0.9
+  patience: 5
+
+iforest:                       # [paper] Liu et al., ICDM 2008 defaults
+  representation: resampled
+  n_estimators: 100
+  max_samples: 256
+  max_features: 1.0
+
+# Baseline ("without") thresholds. Every model is evaluated under every variant so detectors are
+# compared under the same rule; 'primary' is used in figures and headline tables.
+thresholds:
+  primary: p95
+  variants:
+    p95: {method: percentile, q: 95}                                  # Alhammadi et al. 2025
+    pot: {method: pot, risk: 1.0e-5, level: 0.99, multiplier: 1.0}    # SPOT/POT, TranAD's own rule
