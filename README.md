@@ -45,13 +45,9 @@ uncertainty, safety, human oversight, transparency and consistency.
 
 ## 1. Overview
 
-The APU supplies compressed air to a train's brakes, suspension and doors. An air leak makes the compressor run longer
-and more often, raises the pressure at the air-dryer discharge (DV pressure) and heats the oil. Caught late, it takes
-the train out of service.
+The APU supplies compressed air to a train's brakes, suspension and doors. An air leak makes the compressor run longer and more often, raises the pressure at the air-dryer discharge (DV pressure) and heats the oil. Caught late, it takes the train out of service.
 
-The public **MetroPT-3** dataset (Veloso et al., 2022) records 15 APU signals roughly every 10 seconds from February
-to September 2020, but contains **only four reported failures**. That is far too few labels for a supervised model,
-so detection is **unsupervised**: each model learns what normal operation looks like and flags deviations.
+The public **MetroPT-3** dataset (Veloso et al., 2022) records 15 APU signals roughly every 10 seconds from February to September 2020, but contains **only four reported failures**. That is far too few labels for a supervised model, so detection is **unsupervised**: each model learns what normal operation looks like and flags deviations.
 
 **Goals**
 
@@ -67,13 +63,84 @@ so detection is **unsupervised**: each model learns what normal operation looks 
 | TranAD | Tuli et al., VLDB 2022 (official code) | 10-minute means of the 15 signals |
 | Isolation Forest | Liu et al., ICDM 2008 | 10-minute means of the 15 signals |
 
-**Pipeline at a glance**
+### Architecture
 
+```mermaid
+flowchart TB
+    RAW[("MetroPT-3 CSV<br/>15 signals · every 10 s")]
+
+    subgraph DATA["① Data layer"]
+        direction TB
+        Q["Data-quality rules<br/>gaps (Otsu) · R1 frozen data · R2 running · R3 episodes"]
+        CYC["Compressor cycles<br/>44 features"]
+        BIN["10-minute bins<br/>15 signal means"]
+        BENCH["Synthetic benchmark<br/>10 copies · 616 labelled events"]
+        Q --> CYC
+        Q --> BIN
+        Q --> BENCH
+    end
+
+    subgraph DET["② Detection layer"]
+        direction LR
+        LSTM["LSTM-AE"]
+        TRAN["TranAD"]
+        IFOR["Isolation Forest"]
+    end
+
+    BASE["Baseline thresholds<br/>p95 · POT"]
+
+    subgraph TRUST["③ Trustworthy layer"]
+        direction TB
+        CONF["Conformal p-values<br/>operator budget F false alarms/day"]
+        GATE["R1 gate<br/>frozen data → data fault"]
+        COMB["Bonferroni combination<br/>TranAD + LSTM-AE"]
+        TRI["SGR triage<br/>guaranteed risk"]
+        EXPL["Per-alarm explanations<br/>per-sensor error · DIFFI"]
+        CONF --> GATE --> COMB --> TRI
+        COMB --> EXPL
+    end
+
+    subgraph OUT["④ Operator outputs"]
+        direction LR
+        A1["Confirmed leak alarm"]
+        A2["Engineer review"]
+        A3["Data-fault event"]
+    end
+
+    subgraph EVAL["⑤ Evaluation"]
+        direction LR
+        E1["Real failures and episodes<br/>vs chance level"]
+        E2["Synthetic leaks and<br/>sensor faults"]
+        E3["Consistency audit<br/>month · state · time of day"]
+    end
+
+    RAW --> Q
+    CYC --> LSTM
+    BIN --> TRAN
+    BIN --> IFOR
+    BENCH -.->|scored by the same models| DET
+    LSTM --> CONF
+    TRAN --> CONF
+    IFOR --> CONF
+    DET --> BASE
+    BASE -->|baseline results| EVAL
+    TRI --> A1
+    TRI --> A2
+    GATE --> A3
+    EXPL -.->|attached to every alarm| OUT
+    TRUST -->|trustworthy results| EVAL
 ```
-raw data ─► data-quality rules (R1–R3) ─► cycles / 10-min bins ─► 3 baseline detectors
-        ─► conformal p-values ─► R1 gate ─► Bonferroni combination ─► alarm triage ─► explanations
-        ─► evaluation on real failures + synthetic benchmark ─► consistency audit
-```
+
+| Layer | What it does | Scripts | Code |
+|---|---|---|---|
+| ① Data | Derives every data rule from the data; builds both model inputs; creates the labelled synthetic benchmark | `01_prepare_data.py`, `01b_make_benchmark.py` | `src/data/`, `src/benchmark/` |
+| ② Detection | Trains and scores the three published detectors on chronological splits, 3 seeds | `02_run_baselines.py` | `src/models/`, `src/pipeline.py` |
+| Baseline thresholds | Applies the published threshold rules, for comparison with the papers | `03_evaluate.py`, `03b_evaluate_benchmark.py` | `src/thresholds/` |
+| ③ Trustworthy | Turns scores into calibrated alarms, gates logger faults, combines detectors, triages and explains alarms | `04_conformal.py` – `09_explain.py` | `src/trustworthy/` |
+| ④ Outputs | What the operator sees: confirmed leak alarms, alarms for engineer review, data-fault events, each with its explanation | — | — |
+| ⑤ Evaluation | Event metrics against chance, synthetic-benchmark metrics, consistency audit | `03_evaluate.py`, `03b_evaluate_benchmark.py`, `05_evaluate_conformal.py`, `06_combine.py` – `10_audit.py` | `src/evaluation/` |
+
+Two paths run through the same data and detectors: the **baseline path** (published thresholds, reproducing the papers) and the **trustworthy path** (conformal calibration onward), so every improvement is measured against the faithful reproduction.
 
 ---
 
