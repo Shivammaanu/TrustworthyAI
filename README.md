@@ -149,7 +149,7 @@ the evaluation. Re-run from step 1 after adding it.
 ## Citation
 
 ```bibtex
-@unpublished{jain2026trustworthy,
+@unpublished{2026trustworthy,
   author = {Anant Jain, Karmveer Kumar, Shivam Gangwar and Shweta Saharan},
   title  = {Trustworthy Air-Leak Detection for a Metro Air Production Unit: Chance-Aware Evaluation, Data-Quality Rules and a Six-Pillar Trust Layer on {MetroPT-3}},
   note   = {Manuscript under review},
